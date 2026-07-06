@@ -79,29 +79,130 @@ defmodule ElixirSense.Providers.Hover.Docs do
         nil
 
       %{begin: begin_pos, end: end_pos} = context ->
-        metadata =
-          Keyword.get_lazy(options, :metadata, fn ->
-            Parser.parse_string(code, true, false, {line, column})
-          end)
+        # HEEx files contain HTML tags whose `>` is tokenized by the Elixir
+        # lexer (and by toxic2) as the comparison operator `>`, which surfaces
+        # `Kernel.>/2` on hover. That documentation is never useful at an HTML
+        # tag boundary, so detect the HTML-tag case and return nil early.
+        if html_tag_gt?(code, line, column) do
+          nil
+        else
+          metadata =
+            Keyword.get_lazy(options, :metadata, fn ->
+              Parser.parse_string(code, true, false, {line, column})
+            end)
 
-        env =
-          Metadata.get_cursor_env(metadata, {line, column}, {begin_pos, end_pos})
+          env =
+            Metadata.get_cursor_env(metadata, {line, column}, {begin_pos, end_pos})
 
-        case all(context, env, metadata) do
-          [] ->
-            nil
+          case all(context, env, metadata) do
+            [] ->
+              nil
 
-          list ->
-            %{
-              docs: list,
-              range: %{
-                begin: begin_pos,
-                end: end_pos
+            list ->
+              %{
+                docs: list,
+                range: %{
+                  begin: begin_pos,
+                  end: end_pos
+                }
               }
-            }
+          end
         end
     end
   end
+
+  # Detects whether the character at `{line, column}` (1-based) is the `>`
+  # that closes an HTML tag in a HEEx / HTML-EEx template, as opposed to the
+  # Elixir comparison operator `>`.
+  #
+  # HEEx HTML tags (`<header ...>`, `</header>`, `<.link ...>`, `<:slot ...>`)
+  # are tokenized by both the Elixir lexer and toxic2 as Elixir code, so their
+  # closing `>` is classified as the `>` operator and surfaces `Kernel.>/2` on
+  # hover — never useful. We scan the line up to the cursor tracking the depth
+  # of Elixir containers (`()`, `{}`, `[]`); when the cursor `>` sits at depth 0
+  # and the nearest unmatched `<` to its left opens an HTML tag name (an ASCII
+  # identifier, `.link`, `:slot`, `/header`, ...), it is a tag closer.
+  defp html_tag_gt?(code, line, column) do
+    line_str = code |> String.split("\n") |> Enum.at(line - 1, "")
+    prefix = String.slice(line_str, 0, column)
+
+    String.ends_with?(prefix, ">") and
+      (bare_gt_line?(prefix) or tag_closer?(String.to_charlist(prefix)))
+  end
+
+  # True when `prefix` is only whitespace followed by a single `>` — the
+  # closing `>` of a multi-line HTML tag on its own line. In HEEx this is never
+  # the Elixir `>` operator (which would need a left operand on the same line).
+  defp bare_gt_line?(prefix) do
+    String.trim(prefix) == ">"
+  end
+
+  # Scans `chars` (line start up to and including the cursor `>`). Returns true
+  # when the trailing `>` closes an HTML tag rather than being the `>` operator.
+  # A `>` inside `{...}` / `(...)` / `[...]` (e.g. a guard `when x > 0` inside an
+  # attribute expression) is not mistaken for a tag closer because it sits at a
+  # non-zero container depth. The last `<` at depth 0 must be followed by a tag
+  # name: an identifier, `.component`, `:slot`, or `/closing`.
+  defp tag_closer?(chars) do
+    # State: {depth, in_string, last_lt_index}
+    # in_string: nil | quote_char | {:esc, quote_char} (after backslash)
+    {depth, _in_string, last_lt_index} =
+      Enum.reduce(Enum.with_index(chars), {0, nil, nil}, fn
+        # Inside a string: a backslash escapes the next char.
+        {?\\, _i}, {d, q, lt} when q != nil ->
+          {d, {:esc, q}, lt}
+
+        {_c, _i}, {d, {:esc, q}, lt} ->
+          {d, q, lt}
+
+        {c, _i}, {d, q, lt} when q != nil and c == q ->
+          {d, nil, lt}
+
+        {_c, _i}, {d, q, lt} when q != nil ->
+          {d, q, lt}
+
+        # Not in a string: track containers and tag openers.
+        {c, _i}, {0, nil, lt} when c in ~c"({[" ->
+          # Enter a container at depth 0. Keep the pending `<`: if we return
+          # to depth 0 before the cursor, it is still the tag opener.
+          {1, nil, lt}
+
+        {c, _i}, {d, nil, lt} when c in ~c"({[" ->
+          {d + 1, nil, lt}
+
+        {c, _i}, {d, nil, lt} when c in ~c")]}" and d > 0 ->
+          {d - 1, nil, lt}
+
+        {?<, i}, {0, nil, _} ->
+          {0, nil, i}
+
+        {c, _i}, {d, nil, lt} when c in ~c"'" ->
+          {d, ?', lt}
+
+        {c, _i}, {d, nil, lt} when c in ~c"\"" ->
+          {d, ?", lt}
+
+        _, acc ->
+          acc
+      end)
+
+    depth == 0 and last_lt_index != nil and
+      tag_name?(Enum.drop(chars, last_lt_index + 1))
+  end
+
+  # True when the charlist starts with an HTML tag name: an ASCII letter or `_`
+  # (standard tag like `header`), `.`/`:` (component/slot like `.link`/`:slot`),
+  # or `/` (closing tag like `/header`) immediately followed by an identifier.
+  defp tag_name?([?/ | rest]), do: tag_name?(rest)
+  defp tag_name?([?. | rest]), do: identifier_head?(rest)
+  defp tag_name?([?: | rest]), do: identifier_head?(rest)
+  defp tag_name?([c | _]) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
+  defp tag_name?(_), do: false
+
+  defp identifier_head?([c | _]) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_,
+    do: true
+
+  defp identifier_head?(_), do: false
 
   defp all(
          context,
